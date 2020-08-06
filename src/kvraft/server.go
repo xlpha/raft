@@ -3,10 +3,11 @@ package kvraft
 import (
 	"../labgob"
 	"../labrpc"
-	"log"
 	"../raft"
+	"log"
 	"sync"
 	"sync/atomic"
+	"time"
 )
 
 const Debug = 0
@@ -18,11 +19,20 @@ func DPrintf(format string, a ...interface{}) (n int, err error) {
 	return
 }
 
-
 type Op struct {
 	// Your definitions here.
 	// Field names must start with capital letters,
 	// otherwise RPC will break.
+	Key       string
+	Value     string
+	Method    string
+	ClientId  int64
+	RequestId int
+}
+
+type Response struct {
+	ClientId  int64
+	RequestId int
 }
 
 type KVServer struct {
@@ -35,15 +45,90 @@ type KVServer struct {
 	maxraftstate int // snapshot if log grows this big
 
 	// Your definitions here.
+	db                  map[string]string
+	lastAppliedReqIdMap map[int64]int
+	responseChanMap     map[int]chan Response
 }
 
+func (kv *KVServer) isDuplicateRequest(clientId int64, requestId int) bool {
+	appliedReqId, ok := kv.lastAppliedReqIdMap[clientId]
+	if !ok || appliedReqId < requestId {
+		return false
+	}
+	return true
+}
+
+func (kv *KVServer) waitForRaft(op Op) (success bool) {
+	index, _, isLeader := kv.rf.Start(op)
+	if !isLeader {
+		return false
+	}
+
+	kv.mu.Lock()
+	if _, ok := kv.responseChanMap[index]; !ok {
+		kv.responseChanMap[index] = make(chan Response, 1)
+	}
+	ch := kv.responseChanMap[index]
+	kv.mu.Unlock()
+
+	success = true
+	select {
+	case resp := <-ch:
+		if resp.ClientId != op.ClientId || resp.RequestId != op.RequestId {
+			success = false
+		}
+	case <-time.After(500 * time.Millisecond):
+		kv.mu.Lock()
+		if !kv.isDuplicateRequest(op.ClientId, op.RequestId) {
+			success = false
+		}
+		kv.mu.Unlock()
+	}
+	kv.mu.Lock()
+	delete(kv.responseChanMap, index)
+	kv.mu.Unlock()
+	return success
+}
 
 func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 	// Your code here.
+	op := Op{
+		Key:       args.Key,
+		Method:    "Get",
+		ClientId:  args.ClientId,
+		RequestId: args.RequestId,
+	}
+	success := kv.waitForRaft(op)
+	if !success {
+		reply.Err = ErrWrongLeader
+	} else {
+		kv.mu.Lock()
+		value, ok := kv.db[args.Key]
+		kv.mu.Unlock()
+		if ok {
+			reply.Value = value
+			reply.Err = OK
+		} else {
+			reply.Err = ErrNoKey
+		}
+	}
 }
 
 func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	// Your code here.
+	op := Op{
+		Key:       args.Key,
+		Value:     args.Value,
+		Method:    args.Op,
+		ClientId:  args.ClientId,
+		RequestId: args.RequestId,
+	}
+	success := kv.waitForRaft(op)
+	if !success {
+		reply.Err = ErrWrongLeader
+	} else {
+		reply.Err = OK
+	}
 }
 
 //
@@ -96,6 +181,40 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
 
 	// You may need initialization code here.
+	kv.db = make(map[string]string)
+	kv.lastAppliedReqIdMap = make(map[int64]int)
+	kv.responseChanMap = make(map[int]chan Response)
+
+	go func() {
+		for applyMsg := range kv.applyCh {
+			op := applyMsg.Command.(Op)
+			kv.mu.Lock()
+			if kv.isDuplicateRequest(op.ClientId, op.RequestId) {
+				kv.mu.Unlock()
+				continue
+			}
+			switch op.Method {
+			case "Put":
+				kv.db[op.Key] = op.Value
+			case "Append":
+				kv.db[op.Key] += op.Value
+			case "Get":
+				// do nothing
+			}
+			kv.lastAppliedReqIdMap[op.ClientId] = op.RequestId
+
+			if ch, ok := kv.responseChanMap[applyMsg.CommandIndex]; ok {
+				resp := Response{
+					ClientId:  op.ClientId,
+					RequestId: op.RequestId,
+				}
+				ch <- resp
+			}
+			kv.mu.Unlock()
+			DPrintf("kvServer %d applied %s at index=%d, requestId=%d, clientId=%d",
+				kv.me, op.Method, applyMsg.CommandIndex, op.RequestId, op.ClientId)
+		}
+	}()
 
 	return kv
 }
